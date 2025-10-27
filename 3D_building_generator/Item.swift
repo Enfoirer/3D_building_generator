@@ -11,7 +11,7 @@ import Combine
 import Auth0
 import JWTDecode
 
-enum JobStatus: String, CaseIterable, Identifiable {
+enum JobStatus: String, CaseIterable, Identifiable, Codable {
     case queued = "Queued"
     case processing = "Processing"
     case meshing = "Meshing"
@@ -52,14 +52,14 @@ enum JobStatus: String, CaseIterable, Identifiable {
     }
 }
 
-struct UserSession: Identifiable {
+struct UserSession: Identifiable, Codable {
     let id: String
     var name: String
     var email: String
     var pictureURL: URL?
 }
 
-struct ReconstructionJob: Identifiable {
+struct ReconstructionJob: Identifiable, Codable {
     let id: UUID
     var datasetName: String
     var photoCount: Int
@@ -72,7 +72,7 @@ struct ReconstructionJob: Identifiable {
     var downloadEvents: [Date]
 }
 
-struct UploadRecord: Identifiable {
+struct UploadRecord: Identifiable, Codable {
     let id: UUID
     let jobID: UUID
     var datasetName: String
@@ -91,6 +91,7 @@ final class AppState: ObservableObject {
     @Published var uploadRecords: [UploadRecord]
 
     private let authService: AuthService
+    private let storage: AppStateStore
 
     init() {
         do {
@@ -99,55 +100,64 @@ final class AppState: ObservableObject {
         } catch {
             fatalError("Auth0 configuration error: \(error.localizedDescription)")
         }
+        self.storage = AppStateStore()
 
-        let sampleJob = ReconstructionJob(
-            id: UUID(),
-            datasetName: "Campus Library",
-            photoCount: 84,
-            status: .processing,
-            progress: 0.42,
-            modelFileName: nil,
-            createdAt: Date().addingTimeInterval(-3_600),
-            updatedAt: Date(),
-            notes: "Generating dense point cloud.",
-            downloadEvents: []
-        )
-
-        let completedJob = ReconstructionJob(
-            id: UUID(),
-            datasetName: "Downtown Facade",
-            photoCount: 126,
-            status: .completed,
-            progress: 1.0,
-            modelFileName: "downtown_facade.glb",
-            createdAt: Date().addingTimeInterval(-86_400 * 2),
-            updatedAt: Date().addingTimeInterval(-2_700),
-            notes: "Model optimized for AR preview.",
-            downloadEvents: [
-                Date().addingTimeInterval(-3_600),
-                Date().addingTimeInterval(-900)
-            ]
-        )
-
-        self.currentUser = nil
-        self.credentials = nil
-        self.jobs = [sampleJob, completedJob]
-        self.uploadRecords = [
-            UploadRecord(
+        if let snapshot = storage.loadSnapshot() {
+            self.currentUser = snapshot.currentUser
+            self.credentials = nil
+            self.jobs = snapshot.jobs
+            self.uploadRecords = snapshot.uploadRecords
+        } else {
+            let sampleJob = ReconstructionJob(
                 id: UUID(),
-                jobID: sampleJob.id,
-                datasetName: sampleJob.datasetName,
-                submittedAt: sampleJob.createdAt,
-                photoCount: sampleJob.photoCount
-            ),
-            UploadRecord(
-                id: UUID(),
-                jobID: completedJob.id,
-                datasetName: completedJob.datasetName,
-                submittedAt: completedJob.createdAt,
-                photoCount: completedJob.photoCount
+                datasetName: "Campus Library",
+                photoCount: 84,
+                status: .processing,
+                progress: 0.42,
+                modelFileName: nil,
+                createdAt: Date().addingTimeInterval(-3_600),
+                updatedAt: Date(),
+                notes: "Generating dense point cloud.",
+                downloadEvents: []
             )
-        ]
+
+            let completedJob = ReconstructionJob(
+                id: UUID(),
+                datasetName: "Downtown Facade",
+                photoCount: 126,
+                status: .completed,
+                progress: 1.0,
+                modelFileName: "downtown_facade.glb",
+                createdAt: Date().addingTimeInterval(-86_400 * 2),
+                updatedAt: Date().addingTimeInterval(-2_700),
+                notes: "Model optimized for AR preview.",
+                downloadEvents: [
+                    Date().addingTimeInterval(-3_600),
+                    Date().addingTimeInterval(-900)
+                ]
+            )
+
+            self.currentUser = nil
+            self.credentials = nil
+            self.jobs = [sampleJob, completedJob]
+            self.uploadRecords = [
+                UploadRecord(
+                    id: UUID(),
+                    jobID: sampleJob.id,
+                    datasetName: sampleJob.datasetName,
+                    submittedAt: sampleJob.createdAt,
+                    photoCount: sampleJob.photoCount
+                ),
+                UploadRecord(
+                    id: UUID(),
+                    jobID: completedJob.id,
+                    datasetName: completedJob.datasetName,
+                    submittedAt: completedJob.createdAt,
+                    photoCount: completedJob.photoCount
+                )
+            ]
+            persistState()
+        }
 
         Task {
             await restoreSession()
@@ -184,6 +194,7 @@ final class AppState: ObservableObject {
 
         credentials = nil
         currentUser = nil
+        persistState()
     }
 
     func createUpload(datasetName: String, photoCount: Int, notes: String?) {
@@ -213,6 +224,7 @@ final class AppState: ObservableObject {
         )
 
         uploadRecords.insert(record, at: 0)
+        persistState()
     }
 
     func markDownload(for jobID: UUID) {
@@ -221,6 +233,17 @@ final class AppState: ObservableObject {
         job.downloadEvents.append(Date())
         job.updateStatus(job.status, progress: job.progress, modelFileName: job.modelFileName)
         jobs[index] = job
+        persistState()
+    }
+
+    private func persistState() {
+        let snapshot = AppStateSnapshot(
+            currentUser: currentUser,
+            jobs: jobs,
+            uploadRecords: uploadRecords,
+            savedAt: Date()
+        )
+        storage.save(snapshot: snapshot)
     }
 
     private func apply(credentials: Credentials) {
@@ -247,6 +270,7 @@ final class AppState: ObservableObject {
             )
 
             authError = nil
+            persistState()
         } catch {
             authError = "Failed to decode id_token: \(error.localizedDescription)"
         }
@@ -259,6 +283,71 @@ private extension ReconstructionJob {
         self.progress = min(max(progress, 0), 1)
         self.modelFileName = modelFileName
         updatedAt = Date()
+    }
+}
+
+struct AppStateSnapshot: Codable {
+    var currentUser: UserSession?
+    var jobs: [ReconstructionJob]
+    var uploadRecords: [UploadRecord]
+    var savedAt: Date
+}
+
+final class AppStateStore {
+    private let fileURL: URL
+    private let encoder: JSONEncoder
+    private let decoder: JSONDecoder
+
+    init(filename: String = "app_state.json") {
+        let fm = FileManager.default
+        let directory = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+
+        if !fm.fileExists(atPath: directory.path) {
+            try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+
+        self.fileURL = directory.appendingPathComponent(filename)
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted]
+        self.encoder = encoder
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        self.decoder = decoder
+    }
+
+    func loadSnapshot() -> AppStateSnapshot? {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return nil
+        }
+
+        do {
+            let data = try Data(contentsOf: fileURL)
+            return try decoder.decode(AppStateSnapshot.self, from: data)
+        } catch {
+#if DEBUG
+            print("AppStateStore load error: \(error)")
+#endif
+            return nil
+        }
+    }
+
+    func save(snapshot: AppStateSnapshot) {
+        do {
+            let data = try encoder.encode(snapshot)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+#if DEBUG
+            print("AppStateStore save error: \(error)")
+#endif
+        }
+    }
+
+    func clear() {
+        try? FileManager.default.removeItem(at: fileURL)
     }
 }
 
