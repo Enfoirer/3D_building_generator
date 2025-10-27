@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>ClientId</key>
+    <string>9Za5G4bAGHJxWB1BD1zRayosS1zwfa3x</string>
+    <key>Domain</key>
+    <string>dev-4lpin7krf1bnddl0.us.auth0.com</string>
+    <key>A0ClientId</key>
+    <string>9Za5G4bAGHJxWB1BD1zRayosS1zwfa3x</string>
+    <key>A0Domain</key>
+    <string>dev-4lpin7krf1bnddl0.us.auth0.com</string>
+</dict>
+</plist>
