@@ -91,6 +91,10 @@ final class AuthService {
                 .scope("openid profile email offline_access")
                 .useEphemeralSession()
 
+            if let callbackURL = makeRedirectURL(pathComponent: "callback") {
+                webAuth = webAuth.redirectURL(callbackURL)
+            }
+
             if let audience = configuration.audience {
                 webAuth = webAuth.audience(audience)
             }
@@ -134,6 +138,10 @@ final class AuthService {
             var webAuth = Auth0
                 .webAuth(clientId: configuration.clientId, domain: configuration.domain)
 
+            if let logoutURL = makeRedirectURL(pathComponent: "logout") {
+                webAuth = webAuth.redirectURL(logoutURL)
+            }
+
             if let audience = configuration.audience {
                 webAuth = webAuth.audience(audience)
             }
@@ -142,5 +150,12 @@ final class AuthService {
                 continuation.resume()
             }
         }
+    }
+
+    private func makeRedirectURL(pathComponent: String) -> URL? {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return nil }
+        let sanitizedPath = pathComponent.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let urlString = "\(configuration.scheme)://\(configuration.domain)/ios/\(bundleID)/\(sanitizedPath)"
+        return URL(string: urlString)
     }
 }
