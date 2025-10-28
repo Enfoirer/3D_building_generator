@@ -35,7 +35,9 @@ async def get_current_user(authorization: str = Header(default=None)) -> AuthCon
 
     token = authorization.split(" ", 1)[1].strip()
     parts = token.split(".")
-    payload = _decode_segment(parts[1]) if len(parts) > 1 else {}
+    payload = _decode_segment(parts[1]) if len(parts) > 1 else None
+    if payload is None:
+        payload = {}
 
     profile = UserProfile(
         id=str(payload.get("sub") or payload.get("user_id") or "anonymous"),
