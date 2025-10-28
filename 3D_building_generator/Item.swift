@@ -117,6 +117,7 @@ struct UploadRecord: Identifiable, Codable {
     var datasetName: String
     var submittedAt: Date
     var photoCount: Int
+    var photosDir: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -124,6 +125,7 @@ struct UploadRecord: Identifiable, Codable {
         case datasetName = "dataset_name"
         case submittedAt = "submitted_at"
         case photoCount = "photo_count"
+        case photosDir = "photos_dir"
     }
 }
 
@@ -140,6 +142,7 @@ final class AppState: ObservableObject {
     private let authService: AuthService
     private let storage: AppStateStore
     private let apiClient: APIClient
+    private var refreshTask: Task<Void, Never>?
 
     init() {
         do {
@@ -198,14 +201,16 @@ final class AppState: ObservableObject {
                     jobID: sampleJob.id,
                     datasetName: sampleJob.datasetName,
                     submittedAt: sampleJob.createdAt,
-                    photoCount: sampleJob.photoCount
+                    photoCount: sampleJob.photoCount,
+                    photosDir: nil
                 ),
                 UploadRecord(
                     id: UUID(),
                     jobID: completedJob.id,
                     datasetName: completedJob.datasetName,
                     submittedAt: completedJob.createdAt,
-                    photoCount: completedJob.photoCount
+                    photoCount: completedJob.photoCount,
+                    photosDir: nil
                 )
             ]
             persistState()
@@ -214,6 +219,10 @@ final class AppState: ObservableObject {
         Task {
             await restoreSession()
         }
+    }
+
+    deinit {
+        refreshTask?.cancel()
     }
 
     func restoreSession() async {
@@ -253,24 +262,26 @@ final class AppState: ObservableObject {
         uploadRecords = []
         persistState()
         storage.clear()
+        stopPolling()
     }
 
     @discardableResult
-    func createUpload(datasetName: String, photoCount: Int, notes: String?) async -> Bool {
+    func createUpload(datasetName: String, notes: String?, photos: [UploadPhotoPayload]) async -> Bool {
+        guard !photos.isEmpty else {
+            authError = "Select at least one photo."
+            return false
+        }
         guard let token = currentAccessToken() else {
             authError = "Missing access token."
             return false
         }
 
-        let payload = UploadCreatePayload(datasetName: datasetName, photoCount: photoCount, notes: notes)
-
         do {
-            let response: UploadResponsePayload = try await apiClient.request(
-                "POST",
-                path: "uploads",
+            let response = try await apiClient.uploadDataset(
                 token: token,
-                body: payload,
-                expecting: UploadResponsePayload.self
+                datasetName: datasetName,
+                notes: notes,
+                photos: photos
             )
 
             merge(job: response.job)
@@ -278,6 +289,7 @@ final class AppState: ObservableObject {
             persistState()
             authError = nil
             await refreshRemoteState()
+            startPollingIfNeeded()
             return true
         } catch {
             authError = error.localizedDescription
@@ -315,6 +327,7 @@ final class AppState: ObservableObject {
 
     func syncWithServer() async {
         await refreshRemoteState()
+        startPollingIfNeeded()
     }
 
     private func persistState() {
@@ -370,6 +383,7 @@ final class AppState: ObservableObject {
 
             authError = nil
             persistState()
+            startPollingIfNeeded()
         } catch {
             authError = "Failed to decode id_token: \(error.localizedDescription)"
         }
@@ -418,10 +432,26 @@ final class AppState: ObservableObject {
             jobs = jobsResponse.jobs.sorted { $0.createdAt > $1.createdAt }
             uploadRecords = uploadsResponse.uploads.sorted { $0.submittedAt > $1.submittedAt }
             persistState()
+            startPollingIfNeeded()
             authError = nil
         } catch {
             authError = error.localizedDescription
         }
+    }
+
+    private func startPollingIfNeeded() {
+        guard refreshTask == nil, currentAccessToken() != nil else { return }
+        refreshTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                await self.refreshRemoteState()
+            }
+        }
+    }
+
+    private func stopPolling() {
+        refreshTask?.cancel()
+        refreshTask = nil
     }
 }
 

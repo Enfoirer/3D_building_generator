@@ -13,18 +13,6 @@ struct APIUserProfile: Decodable {
     let name: String?
 }
 
-struct UploadCreatePayload: Encodable {
-    let datasetName: String
-    let photoCount: Int
-    let notes: String?
-
-    enum CodingKeys: String, CodingKey {
-        case datasetName = "dataset_name"
-        case photoCount = "photo_count"
-        case notes
-    }
-}
-
 struct UploadResponsePayload: Decodable {
     let upload: UploadRecord
     let job: ReconstructionJob
@@ -48,4 +36,10 @@ struct DownloadLogPayload: Encodable {
 
 struct DownloadLogResponsePayload: Decodable {
     let job: ReconstructionJob
+}
+
+struct UploadPhotoPayload {
+    let filename: String
+    let data: Data
+    let mimeType: String
 }

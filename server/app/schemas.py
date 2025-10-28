@@ -49,6 +49,7 @@ class UploadRecord(BaseModel):
     dataset_name: str
     photo_count: int
     submitted_at: datetime = Field(default_factory=datetime.utcnow)
+    photos_dir: Optional[str] = None
 
 
 class UploadCreateRequest(BaseModel):

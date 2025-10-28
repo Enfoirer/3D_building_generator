@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import json
-import threading
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from sqlmodel import Session, select
 
+from .models import DownloadEvent, Job, Upload, User
 from .schemas import (
     DownloadLogRequest,
     DownloadLogResponse,
@@ -24,154 +22,185 @@ from .schemas import (
 )
 
 
-class AppStateData(BaseModel):
-    users: Dict[str, UserProfile] = Field(default_factory=dict)
-    jobs: List[ReconstructionJob] = Field(default_factory=list)
-    uploads: List[UploadRecord] = Field(default_factory=list)
-
-
 class AppStateStore:
     """
-    Minimal JSON-backed persistence layer for the mock backend.
-    Thread-safe for development purposes; not optimized for production.
+    Persistence layer backed by SQLModel + PostgreSQL (or SQLite fallback).
+    Each method expects a live SQLModel Session.
     """
 
-    def __init__(self, file_path: Optional[Path] = None) -> None:
-        base_dir = Path(__file__).resolve().parent.parent / "data"
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-        self._path = file_path or base_dir / "app_state.json"
-        self._lock = threading.RLock()
-        self._state = self._load()
-
-    # ------------------------------------------------------------------ #
-    # Internal helpers
-    # ------------------------------------------------------------------ #
-    def _load(self) -> AppStateData:
-        if not self._path.exists():
-            return AppStateData()
-
-        with self._path.open("r", encoding="utf-8") as fp:
-            payload = json.load(fp)
-            return AppStateData.model_validate(payload)
-
-    def _save(self) -> None:
-        with self._path.open("w", encoding="utf-8") as fp:
-            json.dump(
-                self._state.model_dump(mode="json"),
-                fp,
-                indent=2,
-                ensure_ascii=False,
-            )
+    def __init__(self, session: Session) -> None:
+        self.session = session
 
     # ------------------------------------------------------------------ #
     # User helpers
     # ------------------------------------------------------------------ #
-    def upsert_user(self, profile: UserProfile) -> UserProfile:
-        with self._lock:
-            existing = self._state.users.get(profile.id)
-            if existing:
-                merged = existing.model_copy(update=profile.model_dump(exclude_unset=True))
-                self._state.users[profile.id] = merged
-            else:
-                self._state.users[profile.id] = profile
-            self._save()
-            return self._state.users[profile.id]
+    def upsert_user(self, profile: UserProfile) -> User:
+        user = self.session.get(User, profile.id)
+        if user:
+            user.email = profile.email or user.email
+            user.name = profile.name or user.name
+        else:
+            user = User(id=profile.id, email=profile.email, name=profile.name)
+            self.session.add(user)
+        self.session.commit()
+        self.session.refresh(user)
+        return user
 
     # ------------------------------------------------------------------ #
     # Uploads & jobs
     # ------------------------------------------------------------------ #
     def create_upload(self, owner_id: str, payload: UploadCreateRequest) -> UploadResponse:
-        with self._lock:
-            job = ReconstructionJob(
-                owner_id=owner_id,
-                dataset_name=payload.dataset_name,
-                photo_count=payload.photo_count,
-                notes=payload.notes,
-            )
-            upload = UploadRecord(
-                job_id=job.id,
-                dataset_name=payload.dataset_name,
-                photo_count=payload.photo_count,
-                submitted_at=job.created_at,
-            )
+        upload = Upload(
+            user_id=owner_id,
+            dataset_name=payload.dataset_name,
+            photo_count=payload.photo_count,
+        )
 
-            self._state.jobs.insert(0, job)
-            self._state.uploads.insert(0, upload)
-            self._save()
+        self.session.add(upload)
+        self.session.flush()
+        self.session.refresh(upload)
 
-        return UploadResponse(upload=upload, job=job)
+        job = Job(
+            user_id=owner_id,
+            upload_id=upload.id,
+            dataset_name=payload.dataset_name,
+            photo_count=payload.photo_count,
+            notes=payload.notes,
+            status=JobStatus.QUEUED,
+            progress=0.0,
+        )
+
+        self.session.add(job)
+        self.session.commit()
+        self.session.refresh(upload)
+        self.session.refresh(job)
+
+        return UploadResponse(
+            upload=self._to_upload_record(upload, job.id),
+            job=self._to_reconstruction_job(job),
+        )
 
     def list_uploads(self, owner_id: Optional[str] = None) -> UploadListResponse:
-        with self._lock:
-            uploads: Iterable[UploadRecord]
-            if owner_id:
-                job_ids = {job.id for job in self._state.jobs if job.owner_id == owner_id}
-                uploads = [record for record in self._state.uploads if record.job_id in job_ids]
-            else:
-                uploads = list(self._state.uploads)
+        query = select(Upload)
+        if owner_id:
+            query = query.where(Upload.user_id == owner_id)
 
-            return UploadListResponse(uploads=list(uploads))
+        uploads = self.session.exec(query.order_by(Upload.submitted_at.desc())).all()
+        return UploadListResponse(
+            uploads=[self._to_upload_record(upload, self._job_id_for_upload(upload.id)) for upload in uploads]
+        )
 
     def list_jobs(self, owner_id: Optional[str] = None, status: Optional[JobStatus] = None) -> JobsListResponse:
-        with self._lock:
-            jobs = self._state.jobs
-            if owner_id:
-                jobs = [job for job in jobs if job.owner_id == owner_id]
-            if status:
-                jobs = [job for job in jobs if job.status == status]
-            return JobsListResponse(jobs=list(jobs))
+        query = select(Job)
+        if owner_id:
+            query = query.where(Job.user_id == owner_id)
+        if status:
+            query = query.where(Job.status == status)
+
+        jobs = self.session.exec(query.order_by(Job.created_at.desc())).all()
+        return JobsListResponse(jobs=[self._to_reconstruction_job(job) for job in jobs])
 
     def get_job(self, job_id: UUID) -> ReconstructionJob:
-        with self._lock:
-            for job in self._state.jobs:
-                if job.id == job_id:
-                    return job
-        raise KeyError(f"Job {job_id} not found")
+        job = self.session.get(Job, job_id)
+        if not job:
+            raise KeyError(f"Job {job_id} not found")
+        return self._to_reconstruction_job(job)
+
+    def get_job_entity(self, job_id: UUID) -> Job:
+        job = self.session.get(Job, job_id)
+        if not job:
+            raise KeyError(f"Job {job_id} not found")
+        return job
 
     def update_job(self, job_id: UUID, payload: JobStatusUpdateRequest) -> ReconstructionJob:
-        with self._lock:
-            for index, job in enumerate(self._state.jobs):
-                if job.id == job_id:
-                    updated = job.model_copy()
+        job = self.get_job_entity(job_id)
 
-                    if payload.status is not None:
-                        updated.status = payload.status
-                    if payload.progress is not None:
-                        updated.progress = payload.progress
-                        if updated.progress >= 1.0 and payload.status is None:
-                            updated.status = JobStatus.COMPLETED
-                    if payload.model_file_name is not None:
-                        updated.model_file_name = payload.model_file_name
-                    if payload.notes is not None:
-                        updated.notes = payload.notes
+        if payload.status is not None:
+            job.status = payload.status
+        if payload.progress is not None:
+            job.progress = payload.progress
+            if job.progress >= 1.0 and payload.status is None:
+                job.status = JobStatus.COMPLETED
+        if payload.model_file_name is not None:
+            job.model_file_name = payload.model_file_name
+        if payload.notes is not None:
+            job.notes = payload.notes
 
-                    updated.updated_at = datetime.utcnow()
+        job.updated_at = datetime.utcnow()
+        self.session.add(job)
+        self.session.commit()
+        self.session.refresh(job)
+        return self._to_reconstruction_job(job)
 
-                    self._state.jobs[index] = updated
-                    self._save()
-                    return updated
+    def log_download(self, request: DownloadLogRequest) -> DownloadLogResponse:
+        job = self.get_job_entity(request.job_id)
+        download = DownloadEvent(job_id=job.id)
+        self.session.add(download)
 
-        raise KeyError(f"Job {job_id} not found")
+        job.updated_at = datetime.utcnow()
+        self.session.add(job)
+        self.session.commit()
+        self.session.refresh(job)
+        return DownloadLogResponse(job=self._to_reconstruction_job(job))
 
-    def log_download(self, payload: DownloadLogRequest) -> DownloadLogResponse:
-        with self._lock:
-            for index, job in enumerate(self._state.jobs):
-                if job.id == payload.job_id:
-                    modified = job.model_copy()
-                    modified.download_events.append(datetime.utcnow())
-                    modified.updated_at = datetime.utcnow()
-                    self._state.jobs[index] = modified
-                    self._save()
-                    return DownloadLogResponse(job=modified)
+    def update_upload_media(self, upload_id: UUID, *, photo_count: int, photos_dir: str) -> UploadRecord:
+        upload = self.session.get(Upload, upload_id)
+        if not upload:
+            raise KeyError(f"Upload {upload_id} not found")
+        upload.photo_count = photo_count
+        upload.photos_dir = photos_dir
+        job_id = self._job_id_for_upload(upload_id)
+        self.session.add(upload)
+        job = self.session.get(Job, job_id)
+        if job:
+            job.photo_count = photo_count
+            self.session.add(job)
+        self.session.commit()
+        self.session.refresh(upload)
+        return self._to_upload_record(upload, job_id)
 
-        raise KeyError(f"Job {payload.job_id} not found")
-
-    # ------------------------------------------------------------------ #
-    # Utility
-    # ------------------------------------------------------------------ #
     def reset(self) -> None:
-        with self._lock:
-            self._state = AppStateData()
-            if self._path.exists():
-                self._path.unlink()
+        from sqlmodel import delete
+
+        self.session.exec(delete(DownloadEvent))
+        self.session.exec(delete(Job))
+        self.session.exec(delete(Upload))
+        self.session.exec(delete(User))
+        self.session.commit()
+
+    # ------------------------------------------------------------------ #
+    # Converters
+    # ------------------------------------------------------------------ #
+    def _to_reconstruction_job(self, job: Job) -> ReconstructionJob:
+        events = self.session.exec(
+            select(DownloadEvent.timestamp).where(DownloadEvent.job_id == job.id).order_by(DownloadEvent.timestamp.asc())
+        ).all()
+
+        return ReconstructionJob(
+            id=job.id,
+            owner_id=job.user_id,
+            dataset_name=job.dataset_name,
+            photo_count=job.photo_count,
+            status=job.status,
+            progress=job.progress,
+            notes=job.notes,
+            model_file_name=job.model_file_name,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+            download_events=events,
+        )
+
+    def _to_upload_record(self, upload: Upload, job_id: UUID) -> UploadRecord:
+        return UploadRecord(
+            id=upload.id,
+            job_id=job_id,
+            dataset_name=upload.dataset_name,
+            photo_count=upload.photo_count,
+            submitted_at=upload.submitted_at,
+        )
+
+    def _job_id_for_upload(self, upload_id: UUID) -> UUID:
+        job_id = self.session.exec(select(Job.id).where(Job.upload_id == upload_id)).first()
+        if not job_id:
+            raise KeyError(f"No job found for upload {upload_id}")
+        return job_id

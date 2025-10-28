@@ -7,6 +7,7 @@
 
 import SwiftUI
 import PhotosUI
+import UIKit
 
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
@@ -333,10 +334,19 @@ private struct UploadView: View {
         isSubmitting = true
         submitError = nil
         let trimmedName = datasetName.trimmingCharacters(in: .whitespaces)
+        let cleanedNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let photos = await loadSelectedPhotos()
+
+        guard !photos.isEmpty else {
+            isSubmitting = false
+            submitError = "Unable to read the selected photos."
+            return
+        }
+
         let success = await appState.createUpload(
             datasetName: trimmedName,
-            photoCount: selectedItems.count,
-            notes: notes.trimmingCharacters(in: .whitespacesAndNewlines)
+            notes: cleanedNotes.isEmpty ? nil : cleanedNotes,
+            photos: photos
         )
         isSubmitting = false
 
@@ -350,6 +360,23 @@ private struct UploadView: View {
         notes = ""
         selectedItems.removeAll()
         showSuccessBanner = true
+    }
+
+    private func loadSelectedPhotos() async -> [UploadPhotoPayload] {
+        var prepared: [UploadPhotoPayload] = []
+        for (index, item) in selectedItems.enumerated() {
+            do {
+                if let data = try await item.loadTransferable(type: Data.self),
+                   let image = UIImage(data: data),
+                   let jpeg = image.jpegData(compressionQuality: 0.9) {
+                    let filename = "photo_\(index + 1).jpg"
+                    prepared.append(UploadPhotoPayload(filename: filename, data: jpeg, mimeType: "image/jpeg"))
+                }
+            } catch {
+                continue
+            }
+        }
+        return prepared
     }
 }
 

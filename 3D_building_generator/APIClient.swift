@@ -54,6 +54,49 @@ struct APIClient {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
 
+        return try await send(request: request, expecting: expecting)
+    }
+
+    func uploadDataset(
+        token: String,
+        datasetName: String,
+        notes: String?,
+        photos: [UploadPhotoPayload]
+    ) async throws -> UploadResponsePayload {
+        guard !photos.isEmpty else {
+            throw APIError(message: "Select at least one photo.", statusCode: nil)
+        }
+
+        var request = URLRequest(url: baseURL.appendingPathComponent("uploads"))
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let boundary = "Boundary-\(UUID().uuidString)"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+        var body = Data()
+        body.appendFormField(name: "dataset_name", value: datasetName, boundary: boundary)
+        if let notes, !notes.isEmpty {
+            body.appendFormField(name: "notes", value: notes, boundary: boundary)
+        }
+        for photo in photos {
+            body.appendFileField(
+                name: "files",
+                filename: photo.filename,
+                contentType: photo.mimeType,
+                data: photo.data,
+                boundary: boundary
+            )
+        }
+        body.appendString("--\(boundary)--\r\n")
+
+        request.httpBody = body
+
+        return try await send(request: request, expecting: UploadResponsePayload.self)
+    }
+
+    private func send<T: Decodable>(request: URLRequest, expecting: T.Type) async throws -> T {
         let (data, response) = try await urlSession.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -104,5 +147,27 @@ private struct AnyEncodable: Encodable {
 
     func encode(to encoder: Encoder) throws {
         try encodeClosure(encoder)
+    }
+}
+
+private extension Data {
+    mutating func appendFormField(name: String, value: String, boundary: String) {
+        appendString("--\(boundary)\r\n")
+        appendString("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
+        appendString("\(value)\r\n")
+    }
+
+    mutating func appendFileField(name: String, filename: String, contentType: String, data: Data, boundary: String) {
+        appendString("--\(boundary)\r\n")
+        appendString("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename)\"\r\n")
+        appendString("Content-Type: \(contentType)\r\n\r\n")
+        append(data)
+        appendString("\r\n")
+    }
+
+    mutating func appendString(_ string: String) {
+        if let data = string.data(using: .utf8) {
+            append(data)
+        }
     }
 }

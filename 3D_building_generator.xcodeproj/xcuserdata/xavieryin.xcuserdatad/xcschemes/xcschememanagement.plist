@@ -9,6 +9,29 @@
 			<key>orderHint</key>
 			<integer>0</integer>
 		</dict>
+		<key>JWTDecode (Playground).xcscheme</key>
+		<dict>
+			<key>orderHint</key>
+			<integer>1</integer>
+		</dict>
+	</dict>
+	<key>SuppressBuildableAutocreation</key>
+	<dict>
+		<key>6EBED93A2EB00FB3004BC4E6</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
+		<key>6EBED9492EB00FB4004BC4E6</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
+		<key>6EBED9532EB00FB4004BC4E6</key>
+		<dict>
+			<key>primary</key>
+			<true/>
+		</dict>
 	</dict>
 </dict>
 </plist>
