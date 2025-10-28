@@ -12,14 +12,31 @@ import Auth0
 import JWTDecode
 
 enum JobStatus: String, CaseIterable, Identifiable, Codable {
-    case queued = "Queued"
-    case processing = "Processing"
-    case meshing = "Meshing"
-    case texturing = "Texturing"
-    case completed = "Completed"
-    case failed = "Failed"
+    case queued
+    case processing
+    case meshing
+    case texturing
+    case completed
+    case failed
 
     var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .queued:
+            return "Queued"
+        case .processing:
+            return "Processing"
+        case .meshing:
+            return "Meshing"
+        case .texturing:
+            return "Texturing"
+        case .completed:
+            return "Completed"
+        case .failed:
+            return "Failed"
+        }
+    }
 
     var accentColor: Color {
         switch self {
@@ -57,19 +74,41 @@ struct UserSession: Identifiable, Codable {
     var name: String
     var email: String
     var pictureURL: URL?
+
+    init(id: String, name: String, email: String, pictureURL: URL? = nil) {
+        self.id = id
+        self.name = name
+        self.email = email
+        self.pictureURL = pictureURL
+    }
 }
 
 struct ReconstructionJob: Identifiable, Codable {
     let id: UUID
+    var ownerID: String
     var datasetName: String
     var photoCount: Int
     var status: JobStatus
     var progress: Double
+    var notes: String?
     var modelFileName: String?
     var createdAt: Date
     var updatedAt: Date
-    var notes: String?
     var downloadEvents: [Date]
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case ownerID = "owner_id"
+        case datasetName = "dataset_name"
+        case photoCount = "photo_count"
+        case status
+        case progress
+        case notes
+        case modelFileName = "model_file_name"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case downloadEvents = "download_events"
+    }
 }
 
 struct UploadRecord: Identifiable, Codable {
@@ -78,6 +117,14 @@ struct UploadRecord: Identifiable, Codable {
     var datasetName: String
     var submittedAt: Date
     var photoCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case jobID = "job_id"
+        case datasetName = "dataset_name"
+        case submittedAt = "submitted_at"
+        case photoCount = "photo_count"
+    }
 }
 
 @MainActor
@@ -92,6 +139,7 @@ final class AppState: ObservableObject {
 
     private let authService: AuthService
     private let storage: AppStateStore
+    private let apiClient: APIClient
 
     init() {
         do {
@@ -101,6 +149,7 @@ final class AppState: ObservableObject {
             fatalError("Auth0 configuration error: \(error.localizedDescription)")
         }
         self.storage = AppStateStore()
+        self.apiClient = APIClient()
 
         if let snapshot = storage.loadSnapshot() {
             self.currentUser = snapshot.currentUser
@@ -108,29 +157,32 @@ final class AppState: ObservableObject {
             self.jobs = snapshot.jobs
             self.uploadRecords = snapshot.uploadRecords
         } else {
+            let ownerID = "local-preview-user"
             let sampleJob = ReconstructionJob(
                 id: UUID(),
+                ownerID: ownerID,
                 datasetName: "Campus Library",
                 photoCount: 84,
                 status: .processing,
                 progress: 0.42,
+                notes: "Generating dense point cloud.",
                 modelFileName: nil,
                 createdAt: Date().addingTimeInterval(-3_600),
                 updatedAt: Date(),
-                notes: "Generating dense point cloud.",
                 downloadEvents: []
             )
 
             let completedJob = ReconstructionJob(
                 id: UUID(),
+                ownerID: ownerID,
                 datasetName: "Downtown Facade",
                 photoCount: 126,
                 status: .completed,
                 progress: 1.0,
+                notes: "Model optimized for AR preview.",
                 modelFileName: "downtown_facade.glb",
                 createdAt: Date().addingTimeInterval(-86_400 * 2),
                 updatedAt: Date().addingTimeInterval(-2_700),
-                notes: "Model optimized for AR preview.",
                 downloadEvents: [
                     Date().addingTimeInterval(-3_600),
                     Date().addingTimeInterval(-900)
@@ -168,6 +220,7 @@ final class AppState: ObservableObject {
         guard let credentials = await authService.retrieveStoredCredentials() else { return }
 
         apply(credentials: credentials)
+        await refreshRemoteState()
     }
 
     func beginLogin() async {
@@ -179,6 +232,7 @@ final class AppState: ObservableObject {
         do {
             let credentials = try await authService.login()
             apply(credentials: credentials)
+            await refreshRemoteState()
         } catch {
             authError = error.localizedDescription
         }
@@ -194,46 +248,73 @@ final class AppState: ObservableObject {
 
         credentials = nil
         currentUser = nil
+        authError = nil
+        jobs = []
+        uploadRecords = []
         persistState()
+        storage.clear()
     }
 
-    func createUpload(datasetName: String, photoCount: Int, notes: String?) {
-        let jobID = UUID()
-        let now = Date()
-        let job = ReconstructionJob(
-            id: jobID,
-            datasetName: datasetName,
-            photoCount: photoCount,
-            status: .queued,
-            progress: 0,
-            modelFileName: nil,
-            createdAt: now,
-            updatedAt: now,
-            notes: notes,
-            downloadEvents: []
-        )
+    @discardableResult
+    func createUpload(datasetName: String, photoCount: Int, notes: String?) async -> Bool {
+        guard let token = currentAccessToken() else {
+            authError = "Missing access token."
+            return false
+        }
 
-        jobs.insert(job, at: 0)
+        let payload = UploadCreatePayload(datasetName: datasetName, photoCount: photoCount, notes: notes)
 
-        let record = UploadRecord(
-            id: UUID(),
-            jobID: jobID,
-            datasetName: datasetName,
-            submittedAt: now,
-            photoCount: photoCount
-        )
+        do {
+            let response: UploadResponsePayload = try await apiClient.request(
+                "POST",
+                path: "uploads",
+                token: token,
+                body: payload,
+                expecting: UploadResponsePayload.self
+            )
 
-        uploadRecords.insert(record, at: 0)
-        persistState()
+            merge(job: response.job)
+            merge(upload: response.upload)
+            persistState()
+            authError = nil
+            await refreshRemoteState()
+            return true
+        } catch {
+            authError = error.localizedDescription
+            return false
+        }
     }
 
-    func markDownload(for jobID: UUID) {
-        guard let index = jobs.firstIndex(where: { $0.id == jobID }) else { return }
-        var job = jobs[index]
-        job.downloadEvents.append(Date())
-        job.updateStatus(job.status, progress: job.progress, modelFileName: job.modelFileName)
-        jobs[index] = job
-        persistState()
+    @discardableResult
+    func markDownload(for jobID: UUID) async -> Bool {
+        guard let token = currentAccessToken() else {
+            authError = "Missing access token."
+            return false
+        }
+
+        let payload = DownloadLogPayload(jobID: jobID)
+
+        do {
+            let response: DownloadLogResponsePayload = try await apiClient.request(
+                "POST",
+                path: "downloads",
+                token: token,
+                body: payload,
+                expecting: DownloadLogResponsePayload.self
+            )
+
+            merge(job: response.job)
+            persistState()
+            authError = nil
+            return true
+        } catch {
+            authError = error.localizedDescription
+            return false
+        }
+    }
+
+    func syncWithServer() async {
+        await refreshRemoteState()
     }
 
     private func persistState() {
@@ -244,6 +325,24 @@ final class AppState: ObservableObject {
             savedAt: Date()
         )
         storage.save(snapshot: snapshot)
+    }
+
+    private func merge(job: ReconstructionJob) {
+        if let index = jobs.firstIndex(where: { $0.id == job.id }) {
+            jobs[index] = job
+        } else {
+            jobs.insert(job, at: 0)
+        }
+        jobs.sort { $0.createdAt > $1.createdAt }
+    }
+
+    private func merge(upload: UploadRecord) {
+        if let index = uploadRecords.firstIndex(where: { $0.id == upload.id }) {
+            uploadRecords[index] = upload
+        } else {
+            uploadRecords.insert(upload, at: 0)
+        }
+        uploadRecords.sort { $0.submittedAt > $1.submittedAt }
     }
 
     private func apply(credentials: Credentials) {
@@ -273,6 +372,55 @@ final class AppState: ObservableObject {
             persistState()
         } catch {
             authError = "Failed to decode id_token: \(error.localizedDescription)"
+        }
+    }
+
+    private func currentAccessToken() -> String? {
+        if let token = credentials?.accessToken, !token.isEmpty {
+            return token
+        }
+        if let idToken = credentials?.idToken, !idToken.isEmpty {
+            return idToken
+        }
+        return ProcessInfo.processInfo.environment["API_BEARER_TOKEN"]
+    }
+
+    private func refreshRemoteState() async {
+        guard let token = currentAccessToken() else { return }
+
+        do {
+            let profile: APIUserProfile = try await apiClient.request(
+                "GET",
+                path: "me",
+                token: token,
+                expecting: APIUserProfile.self
+            )
+
+            let resolvedName = profile.name ?? currentUser?.name ?? profile.email ?? "Creator"
+            let resolvedEmail = profile.email ?? currentUser?.email ?? ""
+            let pictureURL = currentUser?.pictureURL
+            currentUser = UserSession(id: profile.id, name: resolvedName, email: resolvedEmail, pictureURL: pictureURL)
+
+            let uploadsResponse: UploadListResponsePayload = try await apiClient.request(
+                "GET",
+                path: "uploads",
+                token: token,
+                expecting: UploadListResponsePayload.self
+            )
+
+            let jobsResponse: JobsListResponsePayload = try await apiClient.request(
+                "GET",
+                path: "jobs",
+                token: token,
+                expecting: JobsListResponsePayload.self
+            )
+
+            jobs = jobsResponse.jobs.sorted { $0.createdAt > $1.createdAt }
+            uploadRecords = uploadsResponse.uploads.sorted { $0.submittedAt > $1.submittedAt }
+            persistState()
+            authError = nil
+        } catch {
+            authError = error.localizedDescription
         }
     }
 }
@@ -361,6 +509,11 @@ extension AppState {
             email: "preview@example.com",
             pictureURL: URL(string: "https://avatars.githubusercontent.com/u/1?v=4")
         )
+        state.jobs = state.jobs.map { job in
+            var updated = job
+            updated.ownerID = state.currentUser?.id ?? job.ownerID
+            return updated
+        }
         return state
     }
 }

@@ -88,6 +88,7 @@ private struct LoginView: View {
 }
 
 private struct AuthenticatedRootView: View {
+    @EnvironmentObject private var appState: AppState
     var body: some View {
         TabView {
             DashboardView()
@@ -109,6 +110,9 @@ private struct AuthenticatedRootView: View {
                 .tabItem {
                     Label("Account", systemImage: "person.crop.circle")
                 }
+        }
+        .task {
+            await appState.syncWithServer()
         }
     }
 }
@@ -151,7 +155,7 @@ private struct DashboardView: View {
                     } else {
                         ForEach(completedJobs) { job in
                             JobRow(job: job) {
-                                appState.markDownload(for: job.id)
+                                await appState.markDownload(for: job.id)
                             }
                         }
                     }
@@ -164,7 +168,7 @@ private struct DashboardView: View {
 
 private struct JobRow: View {
     let job: ReconstructionJob
-    var downloadAction: (() -> Void)? = nil
+    var downloadAction: (() async -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -194,7 +198,11 @@ private struct JobRow: View {
             }
 
             if job.status == .completed, let action = downloadAction {
-                Button(action: action) {
+                Button {
+                    Task {
+                        await action()
+                    }
+                } label: {
                     Label("Download model", systemImage: "arrow.down.circle")
                         .frame(maxWidth: .infinity)
                 }
@@ -233,6 +241,7 @@ private struct JobStatusBadge: View {
 
     var body: some View {
         Label(status.rawValue, systemImage: status.iconName)
+        Label(status.displayName, systemImage: status.iconName)
             .font(.caption)
             .bold()
             .padding(.vertical, 6)
@@ -250,6 +259,8 @@ private struct UploadView: View {
     @State private var selectedItems: [PhotosPickerItem] = []
     @State private var showSuccessBanner = false
     @State private var recentlySubmittedName = ""
+    @State private var isSubmitting = false
+    @State private var submitError: String?
 
     private var canSubmit: Bool {
         !datasetName.trimmingCharacters(in: .whitespaces).isEmpty && !selectedItems.isEmpty
@@ -286,13 +297,26 @@ private struct UploadView: View {
                 }
 
                 Section("Submit") {
-                    Button {
-                        submitUpload()
-                    } label: {
-                        Label("Submit dataset", systemImage: "paperplane.fill")
-                            .frame(maxWidth: .infinity, alignment: .center)
+                    if let submitError {
+                        Text(submitError)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
                     }
-                    .disabled(!canSubmit)
+
+                    Button {
+                        Task {
+                            await submitUpload()
+                        }
+                    } label: {
+                        if isSubmitting {
+                            ProgressView()
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        } else {
+                            Label("Submit dataset", systemImage: "paperplane.fill")
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        }
+                    }
+                    .disabled(!canSubmit || isSubmitting)
                 }
             }
             .navigationTitle("New Upload")
@@ -304,16 +328,22 @@ private struct UploadView: View {
         }
     }
 
-    private func submitUpload() {
+    private func submitUpload() async {
         guard canSubmit else { return }
-
+        isSubmitting = true
+        submitError = nil
         let trimmedName = datasetName.trimmingCharacters(in: .whitespaces)
-        let photoCount = selectedItems.count
-        appState.createUpload(
+        let success = await appState.createUpload(
             datasetName: trimmedName,
-            photoCount: photoCount,
+            photoCount: selectedItems.count,
             notes: notes.trimmingCharacters(in: .whitespacesAndNewlines)
         )
+        isSubmitting = false
+
+        guard success else {
+            submitError = appState.authError ?? "Failed to submit dataset."
+            return
+        }
 
         recentlySubmittedName = trimmedName
         datasetName = ""
@@ -366,14 +396,16 @@ private struct HistoryView: View {
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
 
-                                ForEach(job.downloadEvents.indices, id: \.self) { index in
-                                    Text("• \(job.downloadEvents[index].timestampDescription)")
+                                ForEach(job.downloadEvents.sorted(by: >), id: \.self) { event in
+                                    Text("• \(event.timestampDescription)")
                                         .font(.footnote)
                                         .foregroundStyle(.secondary)
                                 }
 
                                 Button {
-                                    appState.markDownload(for: job.id)
+                                    Task {
+                                        _ = await appState.markDownload(for: job.id)
+                                    }
                                 } label: {
                                     Label("Log new download", systemImage: "arrow.down.circle")
                                 }
