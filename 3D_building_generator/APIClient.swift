@@ -93,7 +93,13 @@ struct APIClient {
 
         request.httpBody = body
 
-        return try await send(request: request, expecting: UploadResponsePayload.self)
+        do {
+            let response: UploadResponsePayload = try await send(request: request, expecting: UploadResponsePayload.self)
+            return response
+        } catch {
+            print("Upload dataset failed: \(error)")
+            throw error
+        }
     }
 
     private func send<T: Decodable>(request: URLRequest, expecting: T.Type) async throws -> T {
@@ -107,6 +113,8 @@ struct APIClient {
             let message = String(data: data, encoding: .utf8) ?? "Unknown error"
             throw APIError(message: message, statusCode: httpResponse.statusCode)
         }
+
+        print("API response body:", String(data: data, encoding: .utf8) ?? "nil")
 
         if T.self == EmptyResponse.self {
             return EmptyResponse() as! T

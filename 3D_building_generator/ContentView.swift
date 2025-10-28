@@ -352,6 +352,7 @@ private struct UploadView: View {
 
         guard success else {
             submitError = appState.authError ?? "Failed to submit dataset."
+            print("Upload failed: \(submitError ?? "unknown error")")
             return
         }
 
