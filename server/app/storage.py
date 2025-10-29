@@ -80,6 +80,14 @@ class AppStateStore:
             job=self._to_reconstruction_job(job),
         )
 
+    def attach_external_job_id(self, job_id: UUID, external_job_id: str) -> ReconstructionJob:
+        job = self.get_job_entity(job_id)
+        job.external_job_id = external_job_id
+        self.session.add(job)
+        self.session.commit()
+        self.session.refresh(job)
+        return self._to_reconstruction_job(job)
+
     def list_uploads(self, owner_id: Optional[str] = None) -> UploadListResponse:
         query = select(Upload)
         if owner_id:
@@ -181,6 +189,7 @@ class AppStateStore:
             owner_id=job.user_id,
             dataset_name=job.dataset_name,
             photo_count=job.photo_count,
+            external_job_id=job.external_job_id,
             status=job.status,
             progress=job.progress,
             notes=job.notes,
@@ -197,6 +206,7 @@ class AppStateStore:
             dataset_name=upload.dataset_name,
             photo_count=upload.photo_count,
             submitted_at=upload.submitted_at,
+            photos_dir=upload.photos_dir,
         )
 
     def _job_id_for_upload(self, upload_id: UUID) -> UUID:

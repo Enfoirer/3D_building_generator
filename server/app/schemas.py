@@ -29,6 +29,7 @@ class ReconstructionJob(BaseModel):
     owner_id: str
     dataset_name: str
     photo_count: int
+    external_job_id: Optional[str] = None
     status: JobStatus = JobStatus.QUEUED
     progress: float = 0.0
     notes: Optional[str] = None

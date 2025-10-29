@@ -32,6 +32,7 @@ class Job(SQLModel, table=True):
     upload_id: UUID = Field(foreign_key="upload.id", index=True)
     dataset_name: str
     photo_count: int
+    external_job_id: Optional[str] = Field(default=None, index=True)
     status: JobStatus = Field(
         default=JobStatus.QUEUED,
         sa_column=Column(Enum(JobStatus, name="job_status"), nullable=False, default=JobStatus.QUEUED),

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import os
+import shutil
+from pathlib import Path
 from typing import Optional
 from uuid import UUID
 
@@ -8,7 +12,6 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session
 from PIL import Image
-import io
 
 from .auth import AuthContext, get_current_user
 from .database import get_session, init_db, session_scope
@@ -50,48 +53,144 @@ def get_store(session: Session = Depends(get_session)) -> AppStateStore:
     return AppStateStore(session)
 
 
-class StatusSimulator:
-    def __init__(self) -> None:
+storage_service = LocalStorageService()
+
+
+class ReconstructionRunner:
+    def __init__(self, storage: LocalStorageService) -> None:
+        self.storage = storage
+        self.command_template = os.getenv("RECONSTRUCTION_COMMAND")
+        self.artifact_patterns = [
+            pattern.strip()
+            for pattern in os.getenv(
+                "RECONSTRUCTION_ARTIFACT_PATTERN",
+                "model.glb,model.gltf,*.glb,*.gltf,*.obj,*.ply",
+            ).split(",")
+            if pattern.strip()
+        ]
+        self.allow_simulation = os.getenv("RECONSTRUCTION_ALLOW_SIMULATION", "1") != "0"
         self._tasks: dict[UUID, asyncio.Task[None]] = {}
 
-    def schedule(self, job_id: UUID) -> None:
+    def schedule(self, job_id: UUID, dataset_name: str, photos_dir: str, notes: Optional[str]) -> None:
         loop = asyncio.get_running_loop()
         if job_id in self._tasks:
             self._tasks[job_id].cancel()
-        self._tasks[job_id] = loop.create_task(self._run(job_id))
 
-    async def _run(self, job_id: UUID) -> None:
+        if self.command_template:
+            self._tasks[job_id] = loop.create_task(
+                self._run_pipeline(job_id=job_id, dataset_name=dataset_name, photos_dir=photos_dir, notes=notes or "")
+            )
+        elif self.allow_simulation:
+            self._tasks[job_id] = loop.create_task(self._simulate(job_id))
+        else:
+            raise RuntimeError(
+                "Reconstruction pipeline not configured. Set RECONSTRUCTION_COMMAND or enable simulation."
+            )
+
+    async def _run_pipeline(self, job_id: UUID, dataset_name: str, photos_dir: str, notes: str) -> None:
+        command = self.command_template.format(
+            job_id=job_id,
+            dataset_name=dataset_name,
+            photos_dir=photos_dir,
+            output_dir=self.storage.prepare_work_dir(str(job_id)),
+            work_dir=self.storage.prepare_work_dir(str(job_id)),
+            notes=notes,
+        )
+
+        await self._update_job(
+            job_id,
+            JobStatusUpdateRequest(
+                status=JobStatus.PROCESSING,
+                progress=0.05,
+                notes="Reconstruction started",
+            ),
+        )
+
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        if stdout:
+            print(f"[recon:{job_id}] stdout:\n{stdout.decode(errors='ignore')}")
+        if stderr:
+            print(f"[recon:{job_id}] stderr:\n{stderr.decode(errors='ignore')}")
+
+        if process.returncode != 0:
+            await self._update_job(
+                job_id,
+                JobStatusUpdateRequest(
+                    status=JobStatus.FAILED,
+                    progress=0.0,
+                    notes=f"Pipeline exited with code {process.returncode}",
+                ),
+            )
+            return
+
+        artifact = self._locate_artifact(self.storage.prepare_work_dir(str(job_id)))
+        if not artifact:
+            await self._update_job(
+                job_id,
+                JobStatusUpdateRequest(
+                    status=JobStatus.FAILED,
+                    progress=0.0,
+                    notes="Pipeline finished but no model artifact was found.",
+                ),
+            )
+            return
+
+        stored_path = self.storage.persist_model_artifact(str(job_id), artifact)
+        await self._update_job(
+            job_id,
+            JobStatusUpdateRequest(
+                status=JobStatus.COMPLETED,
+                progress=1.0,
+                notes="Reconstruction complete",
+                model_file_name=stored_path,
+            ),
+        )
+
+    async def _simulate(self, job_id: UUID) -> None:
         steps = [
             (3, JobStatus.PROCESSING, 0.2, "Running structure-from-motion"),
             (4, JobStatus.MESHING, 0.6, "Generating dense mesh"),
             (3, JobStatus.TEXTURING, 0.85, "Baking textures"),
             (2, JobStatus.COMPLETED, 1.0, "Reconstruction complete"),
         ]
-        try:
-            for delay, status, progress, note in steps:
-                await asyncio.sleep(delay)
-                with session_scope() as session:
-                    store = AppStateStore(session)
-                    model_path = None
-                    if status is JobStatus.COMPLETED:
-                        model_path = storage_service.save_model_placeholder(str(job_id))
-                    store.update_job(
-                        job_id,
-                        JobStatusUpdateRequest(
-                            status=status,
-                            progress=progress,
-                            notes=note,
-                            model_file_name=model_path,
-                        ),
-                    )
-        except asyncio.CancelledError:
-            raise
-        finally:
-            self._tasks.pop(job_id, None)
+        for delay, status, progress, note in steps:
+            await asyncio.sleep(delay)
+            model_path = None
+            if status is JobStatus.COMPLETED:
+                model_path = self.storage.save_model_placeholder(str(job_id))
+            await self._update_job(
+                job_id,
+                JobStatusUpdateRequest(
+                    status=status,
+                    progress=progress,
+                    notes=note,
+                    model_file_name=model_path,
+                ),
+            )
+
+    def _locate_artifact(self, directory: Path) -> Optional[Path]:
+        for pattern in self.artifact_patterns:
+            for candidate in Path(directory).rglob(pattern):
+                if candidate.is_file():
+                    return candidate
+        return None
+
+    async def _update_job(self, job_id: UUID, payload: JobStatusUpdateRequest) -> None:
+        def _sync_update() -> None:
+            with session_scope() as session:
+                store = AppStateStore(session)
+                store.update_job(job_id, payload)
+
+        await asyncio.to_thread(_sync_update)
 
 
-status_simulator = StatusSimulator()
-storage_service = LocalStorageService()
+reconstruction_runner = ReconstructionRunner(storage_service)
 
 
 @app.get("/health")
@@ -140,8 +239,9 @@ async def create_upload(
     )
     response = UploadResponse(upload=updated_upload, job=response.job)
 
-    status_simulator.schedule(response.job.id)
-    return response
+    reconstruction_runner.schedule(response.job.id, dataset_name, photos_dir, notes)
+    job = store.get_job(response.job.id)
+    return UploadResponse(upload=updated_upload, job=job)
 
 
 @app.get("/uploads", response_model=UploadListResponse)
