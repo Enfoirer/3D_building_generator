@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+import urllib.request
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Iterable
 from PIL import Image
@@ -57,3 +59,29 @@ class LocalStorageService:
         if source_path.resolve() != target_path.resolve():
             shutil.copy2(source_path, target_path)
         return str(target_path)
+
+    def ingest_artifact_from_uri(self, job_id: str, uri: str, timeout: int = 30) -> str:
+        """
+        Store a model artifact referenced by a local path, file:// URI, or HTTP(S) URL.
+        Returns the persisted path under data/models/<job_id>/.
+        """
+        parsed = urlparse(uri)
+
+        # Local file or file:// URI
+        if parsed.scheme in ("", "file"):
+            source = Path(parsed.path if parsed.scheme else uri).expanduser()
+            if not source.exists():
+                raise FileNotFoundError(f"Artifact not found at {source}")
+            return self.persist_model_artifact(job_id, source)
+
+        # Basic HTTP(S) download
+        if parsed.scheme in ("http", "https"):
+            work_dir = self.prepare_work_dir(job_id)
+            filename = Path(parsed.path).name or "model.glb"
+            target = work_dir / filename
+            with urllib.request.urlopen(uri, timeout=timeout) as response:
+                data = response.read()
+            target.write_bytes(data)
+            return self.persist_model_artifact(job_id, target)
+
+        raise ValueError(f"Unsupported artifact URI scheme: {parsed.scheme or 'unknown'}")

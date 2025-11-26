@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Optional
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, UploadFile, File, Form, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session
 from PIL import Image
 
 from .auth import AuthContext, get_current_user
 from .database import get_session, init_db, session_scope
+from .reconstruction_client import ReconstructionServiceClient, ReconstructionServiceError
 from .schemas import (
     DownloadLogRequest,
     DownloadLogResponse,
@@ -26,6 +27,7 @@ from .schemas import (
     UploadListResponse,
     UploadResponse,
     UserProfile,
+    ReconstructionStatusCallback,
 )
 from .storage import AppStateStore
 from .storage_service import LocalStorageService
@@ -54,11 +56,13 @@ def get_store(session: Session = Depends(get_session)) -> AppStateStore:
 
 
 storage_service = LocalStorageService()
+reconstruction_client = ReconstructionServiceClient.from_env()
 
 
 class ReconstructionRunner:
-    def __init__(self, storage: LocalStorageService) -> None:
+    def __init__(self, storage: LocalStorageService, client: ReconstructionServiceClient | None) -> None:
         self.storage = storage
+        self.external_client = client
         self.command_template = os.getenv("RECONSTRUCTION_COMMAND")
         self.artifact_patterns = [
             pattern.strip()
@@ -71,12 +75,24 @@ class ReconstructionRunner:
         self.allow_simulation = os.getenv("RECONSTRUCTION_ALLOW_SIMULATION", "1") != "0"
         self._tasks: dict[UUID, asyncio.Task[None]] = {}
 
-    def schedule(self, job_id: UUID, dataset_name: str, photos_dir: str, notes: Optional[str]) -> None:
+    def schedule(
+        self, job_id: UUID, dataset_name: str, photos_dir: str, photo_count: int, notes: Optional[str]
+    ) -> None:
         loop = asyncio.get_running_loop()
         if job_id in self._tasks:
             self._tasks[job_id].cancel()
 
-        if self.command_template:
+        if self.external_client:
+            self._tasks[job_id] = loop.create_task(
+                self._submit_external_job(
+                    job_id=job_id,
+                    dataset_name=dataset_name,
+                    photos_dir=photos_dir,
+                    photo_count=photo_count,
+                    notes=notes,
+                )
+            )
+        elif self.command_template:
             self._tasks[job_id] = loop.create_task(
                 self._run_pipeline(job_id=job_id, dataset_name=dataset_name, photos_dir=photos_dir, notes=notes or "")
             )
@@ -86,6 +102,76 @@ class ReconstructionRunner:
             raise RuntimeError(
                 "Reconstruction pipeline not configured. Set RECONSTRUCTION_COMMAND or enable simulation."
             )
+
+    async def _submit_external_job(
+        self, job_id: UUID, dataset_name: str, photos_dir: str, photo_count: int, notes: Optional[str]
+    ) -> None:
+        await self._update_job(
+            job_id,
+            JobStatusUpdateRequest(
+                status=JobStatus.PROCESSING,
+                progress=0.05,
+                notes="Submitting to reconstruction service",
+            ),
+        )
+
+        try:
+            result = await asyncio.to_thread(
+                self.external_client.submit_job,
+                job_id=job_id,
+                dataset_name=dataset_name,
+                photo_count=photo_count,
+                photos_dir=photos_dir,
+                notes=notes,
+            )
+        except ReconstructionServiceError as exc:
+            await self._update_job(
+                job_id,
+                JobStatusUpdateRequest(
+                    status=JobStatus.FAILED,
+                    progress=0.0,
+                    notes=str(exc),
+                ),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            await self._update_job(
+                job_id,
+                JobStatusUpdateRequest(
+                    status=JobStatus.FAILED,
+                    progress=0.0,
+                    notes=f"Unexpected error contacting reconstruction service: {exc}",
+                ),
+            )
+            return
+
+        if result.external_job_id:
+            def _attach() -> None:
+                with session_scope() as session:
+                    store = AppStateStore(session)
+                    store.attach_external_job_id(job_id, result.external_job_id)
+
+            await asyncio.to_thread(_attach)
+
+        if not result.accepted:
+            await self._update_job(
+                job_id,
+                JobStatusUpdateRequest(
+                    status=JobStatus.FAILED,
+                    progress=0.0,
+                    notes=result.message or "Reconstruction service rejected the job.",
+                ),
+            )
+            return
+
+        await self._update_job(
+            job_id,
+            JobStatusUpdateRequest(
+                status=JobStatus.PROCESSING,
+                progress=0.1,
+                notes=result.message or "Job accepted by reconstruction service.",
+            ),
+        )
 
     async def _run_pipeline(self, job_id: UUID, dataset_name: str, photos_dir: str, notes: str) -> None:
         command = self.command_template.format(
@@ -190,7 +276,7 @@ class ReconstructionRunner:
         await asyncio.to_thread(_sync_update)
 
 
-reconstruction_runner = ReconstructionRunner(storage_service)
+reconstruction_runner = ReconstructionRunner(storage_service, reconstruction_client)
 
 
 @app.get("/health")
@@ -239,7 +325,7 @@ async def create_upload(
     )
     response = UploadResponse(upload=updated_upload, job=response.job)
 
-    reconstruction_runner.schedule(response.job.id, dataset_name, photos_dir, notes)
+    reconstruction_runner.schedule(response.job.id, dataset_name, photos_dir, len(images), notes)
     job = store.get_job(response.job.id)
     return UploadResponse(upload=updated_upload, job=job)
 
@@ -316,6 +402,70 @@ async def log_download(
         return store.log_download(payload)
     except KeyError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found") from None
+
+
+def _verify_callback_token(request: Request) -> None:
+    expected = os.getenv("RECON_CALLBACK_TOKEN")
+    if not expected:
+        return
+
+    header = request.headers.get("Authorization")
+    if not header or not header.lower().startswith("bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing callback Authorization header")
+
+    token = header.split(" ", 1)[1].strip()
+    if token != expected:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid callback token")
+
+
+@app.post("/internal/reconstruction/status", status_code=status.HTTP_204_NO_CONTENT, include_in_schema=False)
+async def reconstruction_status_callback(
+    payload: ReconstructionStatusCallback,
+    request: Request,
+    store: AppStateStore = Depends(get_store),
+) -> Response:
+    _verify_callback_token(request)
+
+    try:
+        store.get_job(payload.job_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found") from None
+
+    artifact_path: Optional[str] = None
+    artifact_error: Optional[str] = None
+    if payload.model_uri:
+        try:
+            artifact_path = await asyncio.to_thread(
+                storage_service.ingest_artifact_from_uri, str(payload.job_id), payload.model_uri
+            )
+        except Exception as exc:  # noqa: BLE001
+            artifact_error = str(exc)
+
+    status_override = payload.status
+    progress_override = payload.progress
+    notes = payload.message
+    model_file_name = artifact_path
+
+    if artifact_error:
+        status_override = JobStatus.FAILED
+        progress_override = 0.0
+        notes = f"{payload.message or 'Artifact retrieval failed'} – {artifact_error}"
+        model_file_name = None
+
+    try:
+        store.update_job(
+            payload.job_id,
+            JobStatusUpdateRequest(
+                status=status_override,
+                progress=progress_override,
+                notes=notes,
+                model_file_name=model_file_name,
+            ),
+        )
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found") from None
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.post("/__reset", status_code=status.HTTP_204_NO_CONTENT, include_in_schema=False)

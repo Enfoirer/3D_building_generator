@@ -85,3 +85,11 @@ class DownloadLogRequest(BaseModel):
 
 class DownloadLogResponse(BaseModel):
     job: ReconstructionJob
+
+
+class ReconstructionStatusCallback(BaseModel):
+    job_id: UUID
+    status: Optional[JobStatus] = None
+    progress: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    message: Optional[str] = None
+    model_uri: Optional[str] = None
