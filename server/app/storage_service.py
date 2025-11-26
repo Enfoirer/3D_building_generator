@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 from PIL import Image
 
+from .supabase_storage import SupabaseStorageClient
 
 class StoragePaths:
     UPLOADS_DIR = Path("data/uploads")
@@ -21,8 +22,9 @@ class StoragePaths:
 
 
 class LocalStorageService:
-    def __init__(self) -> None:
+    def __init__(self, supabase_client: SupabaseStorageClient | None = None) -> None:
         StoragePaths.ensure_dirs()
+        self.supabase = supabase_client
 
     def save_photos(self, job_id: str, images: Iterable[Image.Image]) -> tuple[str, list[str]]:
         job_dir = StoragePaths.UPLOADS_DIR / job_id
@@ -39,7 +41,7 @@ class LocalStorageService:
     def save_model_placeholder(self, job_id: str, content: bytes = b"") -> str:
         model_path = StoragePaths.MODELS_DIR / f"{job_id}.glb"
         model_path.write_bytes(content)
-        return str(model_path)
+        return self._maybe_upload_model(job_id, model_path)
 
     def prepare_work_dir(self, job_id: str) -> Path:
         work_dir = StoragePaths.WORK_DIR / job_id
@@ -58,7 +60,7 @@ class LocalStorageService:
         target_path = target_dir / source_path.name
         if source_path.resolve() != target_path.resolve():
             shutil.copy2(source_path, target_path)
-        return str(target_path)
+        return self._maybe_upload_model(job_id, target_path)
 
     def ingest_artifact_from_uri(self, job_id: str, uri: str, timeout: int = 30) -> str:
         """
@@ -85,3 +87,18 @@ class LocalStorageService:
             return self.persist_model_artifact(job_id, target)
 
         raise ValueError(f"Unsupported artifact URI scheme: {parsed.scheme or 'unknown'}")
+
+    def _maybe_upload_model(self, job_id: str, local_path: Path) -> str:
+        """
+        Keep the local path, but if Supabase is configured, upload and return a supabase:// URL.
+        """
+        if not self.supabase:
+            return str(local_path)
+
+        object_key = f"models/{job_id}/{local_path.name}"
+        try:
+            self.supabase.upload_file(object_key, file_path=str(local_path))
+            return f"supabase://{self.supabase.config.bucket}/{object_key}"
+        except Exception:
+            # Fallback to local path if upload fails; pipeline should not crash.
+            return str(local_path)

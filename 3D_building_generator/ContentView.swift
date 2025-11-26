@@ -168,8 +168,11 @@ private struct DashboardView: View {
 }
 
 private struct JobRow: View {
+    @EnvironmentObject private var appState: AppState
     let job: ReconstructionJob
-    var downloadAction: (() async -> Void)? = nil
+    @State private var isDownloading = false
+    @State private var downloadError: String?
+    @State private var shareURL: URL?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -198,18 +201,31 @@ private struct JobRow: View {
                 .foregroundStyle(.secondary)
             }
 
-            if job.status == .completed, let action = downloadAction {
+            if job.status == .completed, job.modelFileName != nil {
                 Button {
                     Task {
-                        await action()
+                        await downloadAndShare()
                     }
                 } label: {
-                    Label("Download model", systemImage: "arrow.down.circle")
-                        .frame(maxWidth: .infinity)
+                    if isDownloading {
+                        ProgressView()
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        Label("Download model", systemImage: "arrow.down.circle")
+                            .frame(maxWidth: .infinity)
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.accentColor)
                 .padding(.top, 6)
+                .disabled(isDownloading)
+            }
+
+            if let error = downloadError {
+                Text(error)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .padding(.top, 4)
             }
 
             if let notes = job.notes, !notes.isEmpty {
@@ -220,6 +236,14 @@ private struct JobRow: View {
             }
         }
         .padding(.vertical, 4)
+        .sheet(isPresented: Binding(
+            get: { shareURL != nil },
+            set: { if !$0 { shareURL = nil } }
+        )) {
+            if let url = shareURL {
+                ActivityView(activityItems: [url])
+            }
+        }
     }
 
     private var progressLabel: String {
@@ -234,6 +258,20 @@ private struct JobRow: View {
         default:
             return "\(percentage)% complete"
         }
+    }
+
+    private func downloadAndShare() async {
+        guard !isDownloading else { return }
+        downloadError = nil
+        isDownloading = true
+        let url = await appState.downloadModel(for: job.id)
+        isDownloading = false
+
+        guard let url else {
+            downloadError = appState.authError ?? "下载失败。"
+            return
+        }
+        shareURL = url
     }
 }
 
@@ -528,6 +566,17 @@ private extension Date {
     var timestampDescription: String {
         Date.timestampFormatter.string(from: self)
     }
+}
+
+struct ActivityView: UIViewControllerRepresentable {
+    let activityItems: [Any]
+    let applicationActivities: [UIActivity]? = nil
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: applicationActivities)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 #Preview {

@@ -10,6 +10,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from sqlmodel import Session
 from PIL import Image
 
@@ -30,7 +31,8 @@ from .schemas import (
     ReconstructionStatusCallback,
 )
 from .storage import AppStateStore
-from .storage_service import LocalStorageService
+from .storage_service import LocalStorageService, StoragePaths
+from .supabase_storage import SupabaseStorageClient, SupabaseStorageConfig
 
 app = FastAPI(
     title="3D Building Generator – Local Backend",
@@ -55,8 +57,10 @@ def get_store(session: Session = Depends(get_session)) -> AppStateStore:
     return AppStateStore(session)
 
 
-storage_service = LocalStorageService()
 reconstruction_client = ReconstructionServiceClient.from_env()
+supabase_config = SupabaseStorageConfig.from_env()
+supabase_client = SupabaseStorageClient(supabase_config) if supabase_config else None
+storage_service = LocalStorageService(supabase_client)
 
 
 class ReconstructionRunner:
@@ -478,3 +482,59 @@ async def reset_state(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient privileges")
     store.reset()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/jobs/{job_id}/artifact")
+async def download_model_artifact(
+    job_id: UUID,
+    context: AuthContext = Depends(get_current_user),
+    store: AppStateStore = Depends(get_store),
+) -> Response:
+    try:
+        job = store.get_job(job_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found") from None
+
+    if job.owner_id != context.profile.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not allowed to access this job")
+
+    if not job.model_file_name:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not available yet")
+
+    # If stored in Supabase, return a signed URL redirect
+    if job.model_file_name.startswith("supabase://"):
+        if not supabase_client:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Supabase not configured")
+        bucket_and_key = job.model_file_name.removeprefix("supabase://")
+        try:
+            bucket, key = bucket_and_key.split("/", 1)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Supabase model path") from None
+        if bucket != supabase_client.config.bucket:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Supabase bucket mismatch")
+        try:
+            signed_url = supabase_client.create_signed_url(key, expires_in=3600)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        response = Response(status_code=status.HTTP_302_FOUND)
+        response.headers["Location"] = signed_url
+        return response
+
+    raw_path = Path(job.model_file_name)
+    candidate = raw_path
+    if not candidate.is_absolute() and not candidate.exists():
+        candidate = StoragePaths.MODELS_DIR / candidate
+
+    resolved = candidate.resolve()
+    models_root = StoragePaths.MODELS_DIR.resolve()
+    if models_root not in resolved.parents and resolved != models_root:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid model path")
+
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model file not found on disk")
+
+    return FileResponse(
+        path=str(resolved),
+        media_type="application/octet-stream",
+        filename=resolved.name,
+    )

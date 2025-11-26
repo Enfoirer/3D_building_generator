@@ -102,6 +102,28 @@ struct APIClient {
         }
     }
 
+    func downloadModel(token: String, jobID: UUID) async throws -> URL {
+        var request = URLRequest(url: baseURL.appendingPathComponent("jobs/\(jobID)/artifact"))
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+
+        let (data, response) = try await urlSession.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError(message: "Invalid response", statusCode: nil)
+        }
+
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let message = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw APIError(message: message, statusCode: httpResponse.statusCode)
+        }
+
+        let suggestedName = httpResponse.suggestedFilename ?? "\(jobID).bin"
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(suggestedName)
+        try data.write(to: destination, options: .atomic)
+        return destination
+    }
+
     private func send<T: Decodable>(request: URLRequest, expecting: T.Type) async throws -> T {
         let (data, response) = try await urlSession.data(for: request)
 

@@ -325,6 +325,24 @@ final class AppState: ObservableObject {
         }
     }
 
+    @discardableResult
+    func downloadModel(for jobID: UUID) async -> URL? {
+        guard let token = currentAccessToken() else {
+            authError = "Missing access token."
+            return nil
+        }
+
+        do {
+            let url = try await apiClient.downloadModel(token: token, jobID: jobID)
+            _ = await markDownload(for: jobID)
+            authError = nil
+            return url
+        } catch {
+            authError = error.localizedDescription
+            return nil
+        }
+    }
+
     func syncWithServer() async {
         await refreshRemoteState()
         startPollingIfNeeded()
