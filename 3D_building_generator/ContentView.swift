@@ -155,9 +155,7 @@ private struct DashboardView: View {
                             .padding(.vertical, 8)
                     } else {
                         ForEach(completedJobs) { job in
-                            JobRow(job: job) {
-                                await appState.markDownload(for: job.id)
-                            }
+                            JobRow(job: job)
                         }
                     }
                 }
